@@ -1,0 +1,13 @@
+# Keep the image small — none of this belongs in the container
+venv/
+out/
+__pycache__/
+*.pyc
+.git/
+.env
+.DS_Store
+.claude/
+# input data is uploaded at runtime, not baked in
+Leads.csv
+leads2.csv
+indian_csv_500.csv

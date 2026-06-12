@@ -1,17 +1,20 @@
-# Render Blueprint — deploys the Super Scraper dashboard as a web service.
+# Render Blueprint — deploys the Super Scraper dashboard as a Docker web service.
 # The dashboard launches super_scraper.py as a managed subprocess, so this one
-# service runs both the UI and the scraper.
+# service runs both the UI and the scraper (with Playwright/Chromium available).
 #
 # After deploy: open the service URL, upload a CSV, press Start.
 services:
   - type: web
     name: super-scraper
-    runtime: python
-    plan: free                       # upgrade to "starter" so long scrapes aren't killed by spin-down
-    buildCommand: pip install -r requirements.txt
-    startCommand: python dashboard.py --out out
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: standard                   # 2 GB RAM — needed for Chromium (browser mode). Starter (512 MB) OOMs with --browser.
+    healthCheckPath: /
     envVars:
-      - key: PYTHON_VERSION
-        value: "3.11.9"
       - key: OPENAI_API_KEY          # set the value in the Render dashboard (kept secret, not in git)
         sync: false
+    # Persistent disk so jobs, report.csv, and resume state survive restarts/redeploys.
+    disk:
+      name: scraper-data
+      mountPath: /var/data           # matches OUT_DIR in the Dockerfile
+      sizeGB: 10
