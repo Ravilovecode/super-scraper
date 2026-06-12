@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rm -rf /tmp/dashtest_out /tmp/test_leads.csv /tmp/dash.log)",
+      "Bash(pkill -f \"dashboard.py --out /tmp\")",
+      "Bash(gh auth *)",
+      "Bash(du -sh .env venv out Leads.csv leads2.csv indian_csv_500.csv)",
+      "Bash(du -sh --exclude=venv .)",
+      "Bash(git rm *)",
+      "Bash(git add *)",
+      "Bash(git -c user.email=ayush@inzint.com -c user.name=Ayush commit -q -m 'Add dashboard run controls \\(CSV upload, start/pause/resume\\) and client docs *)"
+    ]
+  }
+}

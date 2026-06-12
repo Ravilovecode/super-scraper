@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c ' *)",
+      "Bash(ulimit -n)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('dashboard.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "Bash(rm -rf /tmp/dashtest_out)",
+      "Bash(python3 dashboard.py --out /tmp/dashtest_out --port 8077)",
+      "Bash(echo \"server pid $!\")",
+      "Bash(curl -s -X POST \"http://localhost:8077/api/upload?name=test_leads.csv\" --data-binary @/tmp/test_leads.csv)",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s -X POST \"http://localhost:8077/api/start\")",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('ok',d['ok'],'status',d['control']['status'],'|',d['message']\\)\")",
+      "Bash(curl -s \"http://localhost:8077/api/data\")",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\)['control']; print\\('status',d['status'],'btn',repr\\(d['button_label']\\),'action',d['button_action']\\)\")",
+      "Bash(curl -s -X POST \"http://localhost:8077/api/pause\")",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('ok',d['ok'],d['message']\\)\")",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\)['control']; print\\('status',d['status'],'btn',repr\\(d['button_label']\\),'remaining',d['remaining'],'|',d['message'][:80]\\)\")"
+    ]
+  }
+}

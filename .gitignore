@@ -1,0 +1,21 @@
+# Secrets — never commit
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Scraper output (generated, can be large)
+out/
+
+# Input lead data (may contain PII — keep out of the repo by default)
+Leads.csv
+leads2.csv
+indian_csv_500.csv
+
+# macOS
+.DS_Store
+
+# Local Claude Code settings (machine-specific)
+.claude/settings.local.json

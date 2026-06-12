@@ -1,0 +1,8 @@
+httpx
+beautifulsoup4
+lxml
+pandas
+openai
+anthropic
+# optional JS rendering:
+# playwright
