@@ -910,10 +910,14 @@ def main():
     p = argparse.ArgumentParser(description="Super Scraper Dashboard")
     p.add_argument("--out",  default="out",  help="scraper output directory")
     p.add_argument("--csv",  default="",     help="original leads CSV (shows total count)")
-    p.add_argument("--port", type=int, default=8050)
+    p.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8050)),
+                   help="port to serve on (defaults to $PORT if set, else 8050)")
     args = p.parse_args()
     CONFIG["out"] = args.out
     CONFIG["csv"] = args.csv
+
+    # On a hosting platform (Render sets $PORT) don't try to open a local browser.
+    is_server = bool(os.environ.get("PORT"))
 
     # Pre-load a CLI-supplied CSV into the controller so Start works immediately.
     if args.csv and os.path.exists(args.csv):
@@ -929,9 +933,13 @@ def main():
     else:
         CONTROLLER.message = "Upload a CSV to begin."
 
-    import webbrowser
     print(f"Dashboard → http://localhost:{args.port}")
-    webbrowser.open(f"http://localhost:{args.port}")
+    if not is_server:
+        try:
+            import webbrowser
+            webbrowser.open(f"http://localhost:{args.port}")
+        except Exception:
+            pass
     uvicorn.run(app, host="0.0.0.0", port=args.port, log_level="warning")
 
 

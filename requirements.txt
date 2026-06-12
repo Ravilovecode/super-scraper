@@ -4,5 +4,8 @@ lxml
 pandas
 openai
 anthropic
+# dashboard web UI:
+fastapi
+uvicorn
 # optional JS rendering:
 # playwright
