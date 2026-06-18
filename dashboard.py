@@ -45,12 +45,17 @@ class Controller:
         self.proc = None
         self.thread = None
         self.lock = threading.Lock()
-        self.status = "idle"      # idle | running | paused | auto_paused | done | error
+        self.status = "idle"      # idle | running | paused | auto_paused | stopped | done | error
         self.message = "No CSV loaded yet."
         self.csv_path = ""
         self.csv_name = ""
         self.opts = {"concurrency": 30, "details": False, "browser": False}
         self._paused_by_user = False
+        self._stop_requested = False
+        # timer / ETA tracking (a "session" spans start → pause/resume → done)
+        self._run_start = None       # epoch when the current running segment began
+        self._elapsed = 0.0          # accumulated running seconds this session
+        self._session_start_done = 0  # done count when the session first started
 
     # --- helpers ----------------------------------------------------------
     def _input_path(self):
@@ -150,8 +155,16 @@ class Controller:
             if self.opts["browser"]:
                 cmd.append("--browser")
 
-            resuming = self.done_count() > 0
+            resuming = self.status in ("paused", "auto_paused")
             self._paused_by_user = False
+            self._stop_requested = False
+            # session clock: keep accumulating on resume, reset on a fresh start
+            if resuming:
+                self._run_start = time.time()
+            else:
+                self._elapsed = 0.0
+                self._session_start_done = self.done_count()
+                self._run_start = time.time()
             logf = open(self._log_path(), "a", encoding="utf-8")
             logf.write(f"\n=== {'resume' if resuming else 'start'} "
                        f"{datetime.now().isoformat()} ===\n")
@@ -186,6 +199,38 @@ class Controller:
         # monitor thread sets final paused status
         return True, "Pausing…"
 
+    def stop(self):
+        """Fully end the run (terminate the process). Data on disk is kept, so a
+        later Start resumes from the checkpoint, but the session/timer resets."""
+        with self.lock:
+            if self.status not in ("running", "paused", "auto_paused"):
+                return False, "Nothing to stop."
+            self._stop_requested = True
+            proc = self.proc
+            if proc is None:
+                # already paused — no live process; finalize here
+                self._freeze_elapsed()
+                self.status = "stopped"
+                self.message = f"Stopped. {self.done_count()} done. Press Start to run again."
+                return True, self.message
+        proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except Exception:
+            proc.kill()
+        return True, "Stopping…"
+
+    def _freeze_elapsed(self):
+        if self._run_start is not None:
+            self._elapsed += time.time() - self._run_start
+            self._run_start = None
+
+    def elapsed(self):
+        base = self._elapsed
+        if self.status == "running" and self._run_start is not None:
+            base += time.time() - self._run_start
+        return base
+
     def _monitor(self, proc, logf):
         code = proc.wait()
         try:
@@ -195,8 +240,12 @@ class Controller:
         with self.lock:
             if self.proc is not proc:
                 return  # superseded by a newer run
+            self._freeze_elapsed()
             remaining = self.remaining()
-            if self._paused_by_user:
+            if self._stop_requested:
+                self.status = "stopped"
+                self.message = f"Stopped. {self.done_count()} done, {remaining} remaining. Press Start."
+            elif self._paused_by_user:
                 self.status = "paused"
                 self.message = f"Paused. {self.done_count()} done, {remaining} remaining. Press Resume."
             elif code == 0 and remaining == 0:
@@ -234,17 +283,35 @@ class Controller:
             label, action, enabled = "✓  Done", "start", False
         elif st == "error":
             label, action, enabled = "↻  Retry", "start", has_csv
+        elif st == "stopped":
+            label, action, enabled = "▶  Start", "start", has_csv
         else:  # idle
             label, action, enabled = "▶  Start", "start", has_csv
+
+        # timer + ETA (ETA from this session's measured throughput)
+        el = self.elapsed()
+        done, total = self.done_count(), self.total()
+        remaining = max(0, total - done)
+        processed_session = max(0, done - self._session_start_done)
+        eta = None
+        if el > 0 and processed_session > 0 and remaining > 0:
+            rate = processed_session / el          # companies per second
+            if rate > 0:
+                eta = remaining / rate
+        can_stop = st in ("running", "paused", "auto_paused")
         return {
             "status": st,
             "message": self.message,
             "button_label": label,
             "button_action": action,
             "button_enabled": enabled,
+            "can_stop": can_stop,
             "has_csv": has_csv,
             "csv_name": self.csv_name,
-            "remaining": self.remaining(),
+            "remaining": remaining,
+            "elapsed_seconds": round(el, 1),
+            "eta_seconds": round(eta, 1) if eta is not None else None,
+            "running": st == "running",
             "opts": self.opts,
         }
 
@@ -408,6 +475,13 @@ async def pause_run():
                         status_code=200 if ok else 400)
 
 
+@app.post("/api/stop")
+async def stop_run():
+    ok, msg = CONTROLLER.stop()
+    return JSONResponse({"ok": ok, "message": msg, "control": CONTROLLER.snapshot()},
+                        status_code=200 if ok else 400)
+
+
 # ---------------------------------------------------------------------------
 # Frontend — single-page dashboard
 # ---------------------------------------------------------------------------
@@ -480,6 +554,23 @@ HTML = r"""<!DOCTYPE html>
       <button id="run-btn" onclick="runAction()"
               class="px-5 py-2 rounded-lg text-sm font-semibold transition-all"
               style="background:#7c3aed;color:#fff">▶  Start</button>
+
+      <!-- Stop button (only while a run is active/paused) -->
+      <button id="stop-btn" onclick="stopAction()"
+              class="px-4 py-2 rounded-lg text-sm font-semibold transition-all hidden"
+              style="background:#7f1d1d;color:#fecaca;border:1px solid #b91c1c">✕  Stop</button>
+
+      <!-- Live timers -->
+      <div class="flex items-center gap-4 pl-1">
+        <div class="text-xs">
+          <span class="text-slate-500">Elapsed</span>
+          <span id="t-elapsed" class="ml-1 font-mono text-slate-200">00:00</span>
+        </div>
+        <div class="text-xs">
+          <span class="text-slate-500">ETA</span>
+          <span id="t-eta" class="ml-1 font-mono text-slate-200">—</span>
+        </div>
+      </div>
 
       <!-- Options -->
       <div class="flex items-center gap-2 text-xs text-slate-400">
@@ -670,6 +761,20 @@ async function runAction(){
   fetchData();
 }
 
+async function stopAction(){
+  if(!confirm('Stop the current run? Progress is kept on disk — you can Start again later to resume.')) return;
+  const btn=document.getElementById('stop-btn');
+  btn.disabled=true;
+  try{
+    const res=await fetch('/api/stop',{method:'POST'});
+    const data=await res.json();
+    applyControl(data.control);
+    setMsg(data.message);
+  }catch(err){ setMsg('Stop failed: '+err); }
+  btn.disabled=false;
+  fetchData();
+}
+
 async function saveOptions(){
   optsTouched=true;
   const body={
@@ -684,6 +789,28 @@ async function saveOptions(){
 
 function setMsg(m){ document.getElementById('ctrl-msg').textContent=m||''; }
 
+// ---- timer / ETA ---------------------------------------------------------
+let timerBase=0, timerSyncAt=0, timerRunning=false, etaSeconds=null;
+
+function fmtDur(s){
+  if(s==null||isNaN(s)||s<0) return '—';
+  s=Math.round(s);
+  const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), sec=s%60;
+  const pad=n=>String(n).padStart(2,'0');
+  return h>0 ? `${h}:${pad(m)}:${pad(sec)}` : `${pad(m)}:${pad(sec)}`;
+}
+function liveElapsed(){
+  return timerRunning ? timerBase+(Date.now()-timerSyncAt)/1000 : timerBase;
+}
+function tickTimer(){
+  document.getElementById('t-elapsed').textContent=fmtDur(liveElapsed());
+  // count the ETA down between server syncs while running
+  let eta=etaSeconds;
+  if(timerRunning && eta!=null) eta=Math.max(0, eta-(Date.now()-timerSyncAt)/1000);
+  document.getElementById('t-eta').textContent = eta!=null ? '~'+fmtDur(eta) : '—';
+}
+setInterval(tickTimer, 1000);
+
 function applyControl(c){
   if(!c) return;
   CTRL=c;
@@ -695,7 +822,16 @@ function applyControl(c){
   btn.style.background = c.status==='running' ? '#b45309'
                        : (c.status==='auto_paused'||c.status==='error') ? '#b91c1c'
                        : '#7c3aed';
+  // stop button visibility
+  const stop=document.getElementById('stop-btn');
+  stop.classList.toggle('hidden', !c.can_stop);
   document.getElementById('csv-label').textContent=c.has_csv?(c.csv_name||'CSV loaded'):'Upload CSV';
+  // re-sync timer/ETA from the server snapshot
+  timerBase=c.elapsed_seconds||0;
+  timerSyncAt=Date.now();
+  timerRunning=!!c.running;
+  etaSeconds=(c.eta_seconds!=null)?c.eta_seconds:null;
+  tickTimer();
   // reflect server-side options unless the user is actively editing
   if(!optsTouched && c.opts){
     document.getElementById('opt-conc').value=c.opts.concurrency;
@@ -876,9 +1012,10 @@ async function fetchData(){
     }
     const st=(data.control&&data.control.status)||'idle';
     const dotMap={running:'bg-amber-400 pulse',paused:'bg-amber-500',
-      auto_paused:'bg-red-500 pulse',error:'bg-red-500',done:'bg-green-500',idle:'bg-slate-500'};
+      auto_paused:'bg-red-500 pulse',error:'bg-red-500',done:'bg-green-500',
+      stopped:'bg-slate-400',idle:'bg-slate-500'};
     const labelMap={running:'Running…',paused:'Paused',auto_paused:'Auto-paused',
-      error:'Error',done:'Complete',idle:'Idle · refreshes every 3s'};
+      error:'Error',done:'Complete',stopped:'Stopped',idle:'Idle · refreshes every 3s'};
     document.getElementById('live-dot').className='w-2 h-2 rounded-full '+(dotMap[st]||'bg-slate-500');
     document.getElementById('live-label').textContent=labelMap[st]||'Live · refreshes every 3s';
 
