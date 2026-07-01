@@ -277,14 +277,15 @@ async def host_resolves(host: str, timeout: float = 10.0) -> bool:
     return False                      # abandon the still-running lookup; don't await it
 
 
-def _curl_fetch_sync(url: str, timeout: float = 30.0) -> tuple[str, str, int]:
-    """Synchronous Chrome-impersonating fetch using curl_cffi.
+def _curl_fetch_sync(url: str, timeout: float = 30.0,
+                     impersonate: str = "chrome124") -> tuple[str, str, int]:
+    """Synchronous browser-impersonating fetch using curl_cffi.
     Returns (final_url, html, status) or ('', '', 0) on failure.
     Runs in a thread — curl_cffi has no native async API."""
     try:
         from curl_cffi import requests as curl_requests
         r = curl_requests.get(
-            url, impersonate="chrome124",
+            url, impersonate=impersonate,
             timeout=timeout, allow_redirects=True,
             headers={"Accept-Language": "en-US,en;q=0.9,ar;q=0.8"},
         )
@@ -296,10 +297,11 @@ def _curl_fetch_sync(url: str, timeout: float = 30.0) -> tuple[str, str, int]:
         return "", "", 0
 
 
-async def curl_fetch(url: str) -> tuple[str, str, int]:
+async def curl_fetch(url: str, impersonate: str = "chrome124") -> tuple[str, str, int]:
     """Async wrapper — runs _curl_fetch_sync in the DNS thread pool to avoid blocking."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_dns_executor(), _curl_fetch_sync, url)
+    return await loop.run_in_executor(
+        _dns_executor(), _curl_fetch_sync, url, 30.0, impersonate)
 
 
 async def resolve_home(client, base: str) -> tuple[str, str, int]:
@@ -328,6 +330,12 @@ async def resolve_home(client, base: str) -> tuple[str, str, int]:
                 if body:
                     p = urlparse(str(r.url))
                     return f"{p.scheme}://{p.netloc}", body, r.status_code
+        # httpx also failed — try browser impersonation before giving up
+        for impersonate in ("chrome124", "chrome110", "safari17_0"):
+            for cand in base_variants(base):
+                final_url, body, status = await curl_fetch(cand, impersonate=impersonate)
+                if body:
+                    return final_url, body, status
         return base, "", -1
 
     best_status = 0
@@ -345,14 +353,14 @@ async def resolve_home(client, base: str) -> tuple[str, str, int]:
                 return f"{p.scheme}://{p.netloc}", body, r.status_code
 
     # httpx failed — retry with Chrome TLS fingerprint (curl_cffi) for sites that
-    # block non-browser TLS handshakes (Cloudflare, Akamai, etc.)
-    for cand in variants:
-        final_url, body, status = await curl_fetch(cand)
-        if body:
-            return final_url, body, status
-        if status >= 400:
-            best_status = status
-            break   # got a real HTTP response, no point trying more variants
+    # block non-browser TLS handshakes or do bot-detection (Cloudflare, Akamai, etc.)
+    for impersonate in ("chrome124", "chrome110", "safari17_0"):
+        for cand in variants:
+            final_url, body, status = await curl_fetch(cand, impersonate=impersonate)
+            if body:
+                return final_url, body, status
+            if status > 0:
+                best_status = status  # record the response but keep trying
 
     return base, "", best_status
 
