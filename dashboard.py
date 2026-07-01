@@ -49,7 +49,7 @@ class Controller:
         self.message = "No CSV loaded yet."
         self.csv_path = ""
         self.csv_name = ""
-        self.opts = {"concurrency": 30, "details": False, "browser": False}
+        self.opts = {"concurrency": 30, "details": False, "browser": False, "proxy": ""}
         self._paused_by_user = False
         self._stop_requested = False
         # timer / ETA tracking (a "session" spans start → pause/resume → done)
@@ -154,6 +154,8 @@ class Controller:
                 cmd.append("--details")
             if self.opts["browser"]:
                 cmd.append("--browser")
+            if self.opts.get("proxy", "").strip():
+                cmd += ["--proxy", self.opts["proxy"].strip()]
 
             resuming = self.status in ("paused", "auto_paused")
             self._paused_by_user = False
@@ -456,6 +458,7 @@ async def set_options(request: Request):
         CONTROLLER.opts["concurrency"] = max(1, min(100, c))
         CONTROLLER.opts["details"] = bool(body.get("details", CONTROLLER.opts["details"]))
         CONTROLLER.opts["browser"] = bool(body.get("browser", CONTROLLER.opts["browser"]))
+        CONTROLLER.opts["proxy"] = str(body.get("proxy", CONTROLLER.opts.get("proxy", ""))).strip()
     except Exception as e:
         return JSONResponse({"ok": False, "message": str(e)}, status_code=400)
     return JSONResponse({"ok": True, "control": CONTROLLER.snapshot()})
@@ -584,6 +587,11 @@ HTML = r"""<!DOCTYPE html>
       <label class="flex items-center gap-1.5 text-xs text-slate-400 cursor-pointer">
         <input type="checkbox" id="opt-browser" onchange="saveOptions()"> JS Browser
       </label>
+      <div class="flex items-center gap-2 text-xs text-slate-400">
+        <span>Proxy</span>
+        <input type="text" id="opt-proxy" placeholder="http://user:pass@host:port"
+               style="width:220px;padding:6px 8px" onchange="saveOptions()" oninput="saveOptions()">
+      </div>
 
       <!-- Status message -->
       <div class="flex-1 text-right">
@@ -781,6 +789,7 @@ async function saveOptions(){
     concurrency: parseInt(document.getElementById('opt-conc').value||'30'),
     details: document.getElementById('opt-details').checked,
     browser: document.getElementById('opt-browser').checked,
+    proxy: document.getElementById('opt-proxy').value.trim(),
   };
   try{ await fetch('/api/options',{method:'POST',
         headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); }
@@ -837,6 +846,7 @@ function applyControl(c){
     document.getElementById('opt-conc').value=c.opts.concurrency;
     document.getElementById('opt-details').checked=c.opts.details;
     document.getElementById('opt-browser').checked=c.opts.browser;
+    document.getElementById('opt-proxy').value=c.opts.proxy||'';
   }
 }
 

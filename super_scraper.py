@@ -225,13 +225,18 @@ def _dns_executor(workers: int = 128) -> ThreadPoolExecutor:
 
 def _resolve_sync(host: str) -> bool:
     try:
-        socket.getaddrinfo(host, None)
-        return True
+        old = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(8.0)   # per-lookup hard cap; prevents OS default 20-30s hangs
+        try:
+            socket.getaddrinfo(host, None)
+            return True
+        finally:
+            socket.setdefaulttimeout(old)
     except Exception:
         return False
 
 
-async def host_resolves(host: str, timeout: float = 4.0) -> bool:
+async def host_resolves(host: str, timeout: float = 10.0) -> bool:
     """Async DNS check that can't hang the run. getaddrinfo runs in a dedicated
     pool; if it doesn't finish within `timeout` we ABANDON the thread (it can't be
     killed) and return False, so a slow/dead resolver never blocks a worker slot."""
@@ -263,13 +268,23 @@ async def resolve_home(client, base: str) -> tuple[str, str, int]:
         if h not in hosts:
             hosts.append(h)
     resolves = dict(zip(hosts, await asyncio.gather(*(host_resolves(h) for h in hosts))))
-    if not any(resolves.values()):
+    dns_ok = any(resolves.values())
+    # DNS pre-check is an optimisation — it can time out under concurrent load even for
+    # live domains. If all checks failed, still attempt HTTP directly before giving up.
+    if not dns_ok:
+        for cand in base_variants(base):
+            r = await fetch(client, cand, retries=0)
+            if r is not None and r.status_code < 400:
+                body = r.text[:MAX_HTML]
+                if body:
+                    p = urlparse(str(r.url))
+                    return f"{p.scheme}://{p.netloc}", body, r.status_code
         return base, "", -1
 
     best_status = 0
     for cand in variants:
-        if not resolves.get(urlparse(cand).netloc):
-            continue                      # don't waste a connect-timeout on a dead host
+        if dns_ok and not resolves.get(urlparse(cand).netloc):
+            continue                      # only skip when DNS check was conclusive
         r = await fetch(client, cand, retries=0)   # variant diversity IS the retry
         if r is None:
             continue
@@ -892,7 +907,8 @@ async def enrich_descriptions(client, jobs: list[Job], cap: int = 60):
 
 async def process_company(client, ai: AIExtractor, browser: Browser,
                           company: str, website: str,
-                          fetch_details: bool = False) -> tuple[list[Job], Report]:
+                          fetch_details: bool = False,
+                          proxy_client=None) -> tuple[list[Job], Report]:
     t0 = time.time()
     rep = Report(company=company, website=website)
     base = normalize_site(website)
@@ -903,14 +919,21 @@ async def process_company(client, ai: AIExtractor, browser: Browser,
     try:
         career_pages, home_html, base, status = await find_career_pages(client, base)
         if not career_pages and not home_html:
-            if status == -1:
-                rep.error = "DNS does not resolve (bad/fabricated website?)"
-            elif status >= 400:
-                rep.error = f"blocked (HTTP {status})"
-            else:
-                rep.error = "connection failed (timeout / geo-blocked?)"
-            rep.seconds = round(time.time() - t0, 1)
-            return [], rep
+            # Direct connection failed — retry through proxy if one is configured
+            if proxy_client is not None:
+                career_pages, home_html, base, status = await find_career_pages(proxy_client, base)
+            if not career_pages and not home_html:
+                if status == -1:
+                    rep.error = "Site unreachable (DNS check failed — may be geo-blocked or slow resolver)"
+                elif status >= 400:
+                    rep.error = f"blocked (HTTP {status})"
+                else:
+                    rep.error = "connection failed (timeout / geo-blocked?)"
+                rep.seconds = round(time.time() - t0, 1)
+                return [], rep
+            # proxy worked — use it for the rest of this company's pipeline
+            client = proxy_client
+            rep.error = ""   # clear any partial error from the direct attempt
         rep.career_page = career_pages[0] if career_pages else base
         pages_to_try = career_pages or [base]
 
@@ -990,6 +1013,11 @@ async def process_company(client, ai: AIExtractor, browser: Browser,
     finally:
         rep.seconds = round(time.time() - t0, 1)
 
+class _noop_ctx:
+    """Async context manager that yields None — used when no proxy client is needed."""
+    async def __aenter__(self): return None
+    async def __aexit__(self, *_): pass
+
 # ============================================================================
 # Runner — checkpointed, concurrent
 # ============================================================================
@@ -1054,29 +1082,43 @@ async def run(args):
     await browser.start()
     print(f"Browser fallback: {'ON' if browser.enabled else 'OFF'}")
 
+    # Proxy: --proxy flag wins, then env vars (standard convention).
+    # Strategy: try direct first; if unreachable, retry through the proxy.
+    proxy_url = (args.proxy or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or "").strip()
+    print(f"Proxy fallback: {proxy_url or 'none'}")
+
     sem = asyncio.Semaphore(args.concurrency)
     counter = {"i": 0, "jobs": 0}
 
-    async with httpx.AsyncClient(timeout=TIMEOUT, follow_redirects=True,
-                                 limits=httpx.Limits(max_connections=args.concurrency * 2)) as client:
-        async def worker(company, website):
-            async with sem:
-                try:
-                    jobs, rep = await asyncio.wait_for(
-                        process_company(client, ai, browser, company, website,
-                                        fetch_details=args.details),
-                        timeout=COMPANY_TIMEOUT)
-                except asyncio.TimeoutError:
-                    jobs, rep = [], Report(company=company, website=website,
-                                           error=f"timeout (>{COMPANY_TIMEOUT}s, skipped)")
-                await sink.write(website, jobs, rep)
-                counter["i"] += 1
-                counter["jobs"] += len(jobs)
-                status = rep.method or rep.error or "no jobs found"
-                print(f"[{counter['i']}/{len(todo)}] {company[:38]:<38} "
-                      f"{len(jobs):>4} jobs  {status}")
+    client_kwargs = dict(timeout=TIMEOUT, follow_redirects=True,
+                         limits=httpx.Limits(max_connections=args.concurrency * 2))
 
-        await asyncio.gather(*(worker(c, w) for c, w in todo))
+    async with httpx.AsyncClient(**client_kwargs) as client:
+        # Proxy client is only created when a proxy URL is configured.
+        # Each company is tried direct first; if unreachable, process_company
+        # retries automatically through the proxy client.
+        proxy_cm = httpx.AsyncClient(**client_kwargs, proxy=proxy_url) if proxy_url else None
+        async with (proxy_cm if proxy_cm else _noop_ctx()) as proxy_client:
+
+            async def worker(company, website):
+                async with sem:
+                    try:
+                        jobs, rep = await asyncio.wait_for(
+                            process_company(client, ai, browser, company, website,
+                                            fetch_details=args.details,
+                                            proxy_client=proxy_client if proxy_url else None),
+                            timeout=COMPANY_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        jobs, rep = [], Report(company=company, website=website,
+                                               error=f"timeout (>{COMPANY_TIMEOUT}s, skipped)")
+                    await sink.write(website, jobs, rep)
+                    counter["i"] += 1
+                    counter["jobs"] += len(jobs)
+                    status = rep.method or rep.error or "no jobs found"
+                    print(f"[{counter['i']}/{len(todo)}] {company[:38]:<38} "
+                          f"{len(jobs):>4} jobs  {status}")
+
+            await asyncio.gather(*(worker(c, w) for c, w in todo))
 
     await browser.stop()
     total = sink.finalize()
@@ -1122,6 +1164,9 @@ def main():
                    default="auto", help="AI extraction backend (default: auto-detect from env keys)")
     p.add_argument("--ai-model", default="",
                    help="override model, e.g. gpt-5-mini, gpt-4.1, claude-sonnet-4-20250514")
+    p.add_argument("--proxy", default="",
+                   help="HTTP/SOCKS proxy for all requests, e.g. http://user:pass@host:port "
+                        "or socks5://host:port. Also read from HTTPS_PROXY / HTTP_PROXY env vars.")
     args = p.parse_args()
     asyncio.run(run(args))
 
