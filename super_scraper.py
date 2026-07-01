@@ -164,7 +164,7 @@ async def fetch(client: httpx.AsyncClient, url: str, *, method="GET",
                 await asyncio.sleep(2 * (attempt + 1))
                 continue
             return r
-        except (httpx.HTTPError, asyncio.TimeoutError, RuntimeError):
+        except Exception:
             if attempt < retries:
                 await asyncio.sleep(1.5 * (attempt + 1))
     return None
@@ -1067,7 +1067,14 @@ async def process_company(client, ai: AIExtractor, browser: Browser,
         rep.jobs_found = len(all_jobs)
         return all_jobs, rep
     except Exception as e:                          # never kill the run
-        rep.error = f"{type(e).__name__}: {e}"[:200]
+        name = type(e).__name__
+        msg = str(e).strip()
+        # Map low-level network exceptions to readable messages
+        if name in ("RemoteProtocolError", "EndOfStream", "ConnectError",
+                    "ReadError", "WriteError", "ProtocolError"):
+            rep.error = f"connection failed ({name})"
+        else:
+            rep.error = f"{name}: {msg}"[:200]
         return [], rep
     finally:
         rep.seconds = round(time.time() - t0, 1)
