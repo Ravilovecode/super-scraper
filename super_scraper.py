@@ -53,10 +53,33 @@ from bs4 import BeautifulSoup
 # Config
 # ============================================================================
 
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 JobResearchBot/1.0")
-HEADERS = {"User-Agent": UA, "Accept-Language": "en;q=0.9,ar;q=0.8"}
-TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+]
+UA = _USER_AGENTS[0]
+
+def _headers(attempt: int = 0) -> dict:
+    ua = _USER_AGENTS[attempt % len(_USER_AGENTS)]
+    return {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+HEADERS = _headers(0)
+TIMEOUT = httpx.Timeout(30.0, connect=15.0)
 MAX_HTML = 2_500_000          # ignore bodies bigger than this
 AI_TEXT_BUDGET = 14_000       # chars of page text sent to the AI model
 DESC_BUDGET = 4_000           # max chars of job description stored per job
@@ -132,15 +155,16 @@ async def fetch(client: httpx.AsyncClient, url: str, *, method="GET",
         return None                      # skip mailto:/tel:/javascript:/# etc.
     for attempt in range(retries + 1):
         try:
+            hdrs = _headers(attempt)        # rotate UA on each retry
             if method == "POST":
-                r = await client.post(url, json=json_body, headers=HEADERS)
+                r = await client.post(url, json=json_body, headers=hdrs)
             else:
-                r = await client.get(url, headers=HEADERS)
-            if r.status_code in (429, 500, 502, 503, 504) and attempt < retries:
+                r = await client.get(url, headers=hdrs)
+            if r.status_code in (403, 429, 500, 502, 503, 504) and attempt < retries:
                 await asyncio.sleep(2 * (attempt + 1))
                 continue
             return r
-        except (httpx.HTTPError, asyncio.TimeoutError):
+        except (httpx.HTTPError, asyncio.TimeoutError, RuntimeError):
             if attempt < retries:
                 await asyncio.sleep(1.5 * (attempt + 1))
     return None
@@ -253,6 +277,31 @@ async def host_resolves(host: str, timeout: float = 10.0) -> bool:
     return False                      # abandon the still-running lookup; don't await it
 
 
+def _curl_fetch_sync(url: str, timeout: float = 30.0) -> tuple[str, str, int]:
+    """Synchronous Chrome-impersonating fetch using curl_cffi.
+    Returns (final_url, html, status) or ('', '', 0) on failure.
+    Runs in a thread — curl_cffi has no native async API."""
+    try:
+        from curl_cffi import requests as curl_requests
+        r = curl_requests.get(
+            url, impersonate="chrome124",
+            timeout=timeout, allow_redirects=True,
+            headers={"Accept-Language": "en-US,en;q=0.9,ar;q=0.8"},
+        )
+        if r.status_code < 400 and r.text:
+            p = urlparse(str(r.url))
+            return f"{p.scheme}://{p.netloc}", r.text[:MAX_HTML], r.status_code
+        return "", "", r.status_code
+    except Exception:
+        return "", "", 0
+
+
+async def curl_fetch(url: str) -> tuple[str, str, int]:
+    """Async wrapper — runs _curl_fetch_sync in the DNS thread pool to avoid blocking."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_dns_executor(), _curl_fetch_sync, url)
+
+
 async def resolve_home(client, base: str) -> tuple[str, str, int]:
     """Try variants; return (resolved_base, home_html, status).
 
@@ -294,6 +343,17 @@ async def resolve_home(client, base: str) -> tuple[str, str, int]:
             if body:
                 p = urlparse(str(r.url))
                 return f"{p.scheme}://{p.netloc}", body, r.status_code
+
+    # httpx failed — retry with Chrome TLS fingerprint (curl_cffi) for sites that
+    # block non-browser TLS handshakes (Cloudflare, Akamai, etc.)
+    for cand in variants:
+        final_url, body, status = await curl_fetch(cand)
+        if body:
+            return final_url, body, status
+        if status >= 400:
+            best_status = status
+            break   # got a real HTTP response, no point trying more variants
+
     return base, "", best_status
 
 
@@ -919,9 +979,11 @@ async def process_company(client, ai: AIExtractor, browser: Browser,
     try:
         career_pages, home_html, base, status = await find_career_pages(client, base)
         if not career_pages and not home_html:
-            # Direct connection failed — retry through proxy if one is configured
+            # Direct failed — retry via proxy for ALL failure modes (DNS, timeout, 4xx)
             if proxy_client is not None:
                 career_pages, home_html, base, status = await find_career_pages(proxy_client, base)
+                if career_pages or home_html:
+                    client = proxy_client   # proxy worked — use for rest of pipeline
             if not career_pages and not home_html:
                 if status == -1:
                     rep.error = "Site unreachable (DNS check failed — may be geo-blocked or slow resolver)"
@@ -931,9 +993,6 @@ async def process_company(client, ai: AIExtractor, browser: Browser,
                     rep.error = "connection failed (timeout / geo-blocked?)"
                 rep.seconds = round(time.time() - t0, 1)
                 return [], rep
-            # proxy worked — use it for the rest of this company's pipeline
-            client = proxy_client
-            rep.error = ""   # clear any partial error from the direct attempt
         rep.career_page = career_pages[0] if career_pages else base
         pages_to_try = career_pages or [base]
 
@@ -1013,11 +1072,6 @@ async def process_company(client, ai: AIExtractor, browser: Browser,
     finally:
         rep.seconds = round(time.time() - t0, 1)
 
-class _noop_ctx:
-    """Async context manager that yields None — used when no proxy client is needed."""
-    async def __aenter__(self): return None
-    async def __aexit__(self, *_): pass
-
 # ============================================================================
 # Runner — checkpointed, concurrent
 # ============================================================================
@@ -1090,35 +1144,46 @@ async def run(args):
     sem = asyncio.Semaphore(args.concurrency)
     counter = {"i": 0, "jobs": 0}
 
-    client_kwargs = dict(timeout=TIMEOUT, follow_redirects=True,
+    # HTTP/2 support — negotiated via ALPN; fixes 0s failures on sites that reject HTTP/1.1
+    import importlib.util
+    _h2 = importlib.util.find_spec("h2") is not None
+    if not _h2:
+        print("tip: pip install h2  — enables HTTP/2, fixes instant connection failures")
+
+    client_kwargs = dict(timeout=TIMEOUT, follow_redirects=True, http2=_h2,
                          limits=httpx.Limits(max_connections=args.concurrency * 2))
 
-    async with httpx.AsyncClient(**client_kwargs) as client:
-        # Proxy client is only created when a proxy URL is configured.
-        # Each company is tried direct first; if unreachable, process_company
-        # retries automatically through the proxy client.
-        proxy_cm = httpx.AsyncClient(**client_kwargs, proxy=proxy_url) if proxy_url else None
-        async with (proxy_cm if proxy_cm else _noop_ctx()) as proxy_client:
-
-            async def worker(company, website):
-                async with sem:
-                    try:
-                        jobs, rep = await asyncio.wait_for(
+    # Open both clients upfront and close manually — nested async-with closes them
+    # before all workers finish when a timeout cancels a task.
+    client = httpx.AsyncClient(**client_kwargs)
+    proxy_client = httpx.AsyncClient(**client_kwargs, proxy=proxy_url) if proxy_url else None
+    try:
+        async def worker(company, website):
+            async with sem:
+                try:
+                    # asyncio.shield prevents timeout cancellation from corrupting
+                    # the shared httpx client's connection pool
+                    jobs, rep = await asyncio.wait_for(
+                        asyncio.shield(
                             process_company(client, ai, browser, company, website,
                                             fetch_details=args.details,
-                                            proxy_client=proxy_client if proxy_url else None),
-                            timeout=COMPANY_TIMEOUT)
-                    except asyncio.TimeoutError:
-                        jobs, rep = [], Report(company=company, website=website,
-                                               error=f"timeout (>{COMPANY_TIMEOUT}s, skipped)")
-                    await sink.write(website, jobs, rep)
-                    counter["i"] += 1
-                    counter["jobs"] += len(jobs)
-                    status = rep.method or rep.error or "no jobs found"
-                    print(f"[{counter['i']}/{len(todo)}] {company[:38]:<38} "
-                          f"{len(jobs):>4} jobs  {status}")
+                                            proxy_client=proxy_client)),
+                        timeout=COMPANY_TIMEOUT)
+                except asyncio.TimeoutError:
+                    jobs, rep = [], Report(company=company, website=website,
+                                           error=f"timeout (>{COMPANY_TIMEOUT}s, skipped)")
+                await sink.write(website, jobs, rep)
+                counter["i"] += 1
+                counter["jobs"] += len(jobs)
+                status = rep.method or rep.error or "no jobs found"
+                print(f"[{counter['i']}/{len(todo)}] {company[:38]:<38} "
+                      f"{len(jobs):>4} jobs  {status}")
 
-            await asyncio.gather(*(worker(c, w) for c, w in todo))
+        await asyncio.gather(*(worker(c, w) for c, w in todo))
+    finally:
+        await client.aclose()
+        if proxy_client:
+            await proxy_client.aclose()
 
     await browser.stop()
     total = sink.finalize()
